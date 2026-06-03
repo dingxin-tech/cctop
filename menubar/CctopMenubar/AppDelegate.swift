@@ -129,7 +129,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             guard let sessionId = notification.userInfo?["sessionId"] as? String,
                   let session = self?.sessionManager.sessions.first(where: { $0.id == sessionId })
             else { return }
-            self?.focusTerminal(session: session)
+            focusTerminal(session: session)
         }
         nc.addObserver(
             forName: .floatingBallToast, object: nil, queue: .main
