@@ -38,7 +38,7 @@ struct StatusCounts: Equatable {
     var needsAction: Int { permission + attention }
 
     /// Proportional bar segments: (fraction of total, color).
-    /// Used by both MenubarIconRenderer (AppKit) and NotchStatusView (SwiftUI).
+    /// Used by MenubarIconRenderer (AppKit) and FloatingBallView (SwiftUI).
     var barSegments: [(proportion: Double, color: StatusColors.RGBColor)] {
         guard total > 0 else { return [] }
         var segs: [(Double, StatusColors.RGBColor)] = []

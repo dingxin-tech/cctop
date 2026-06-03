@@ -15,16 +15,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var pluginManager: PluginManager!
     private var historyManager: HistoryManager!
     private var navigateController = NavigateController()
-    private var notchController: NotchStatusController!
+    private var floatingBallController: FloatingBallController!
     private var navKeyMonitor: Any?
     private var previousApp: NSRunningApplication?
     private var lastExternalApp: NSRunningApplication?
     private var panelMode: PanelMode = .hidden
     private var screenChangeWork: DispatchWorkItem?
-    private var notchVisibilityWork: DispatchWorkItem?
     private var suppressResize = false
     private var lastRenderedCounts: StatusCounts?
-    private var hasNotch = false
     private var focusLocation: NSPoint?
     private var cancellables: Set<AnyCancellable> = []
     @AppStorage("appearanceMode") var appearanceMode: String = "system"
@@ -41,14 +39,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         migrateLegacyPanelPosition()
         installHookBinaryIfNeeded()
         UNUserNotificationCenter.current().delegate = self
-        notchController = NotchStatusController()
+        floatingBallController = FloatingBallController()
         historyManager = HistoryManager()
         sessionManager = SessionManager(historyManager: historyManager)
         updater = makeUpdater()
         pluginManager = PluginManager()
 
         setupStatusItem()
-        hasNotch = NSScreen.builtin?.hasPhysicalNotch == true
+        floatingBallController.show(
+            on: NSScreen.main ?? NSScreen.screens[0], counts: .zero
+        )
 
         let contentView = PanelContentView(
             sessionManager: sessionManager,
@@ -112,22 +112,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.handleEvent(.appLostFocus)
-            self?.updateNotchVisibility()
         }
         nc.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.handleScreenChange()
         }
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.updateNotchVisibility()
-        }
         nc.addObserver(
-            forName: .notchPillClicked, object: nil, queue: .main
+            forName: .floatingBallClicked, object: nil, queue: .main
         ) { [weak self] _ in
             self?.togglePanel()
+        }
+        nc.addObserver(
+            forName: .floatingBallToastClicked, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let sessionId = notification.userInfo?["sessionId"] as? String,
+                  let session = self?.sessionManager.sessions.first(where: { $0.id == sessionId })
+            else { return }
+            self?.focusTerminal(session: session)
+        }
+        nc.addObserver(
+            forName: .floatingBallToast, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let toast = notification.object as? ToastEvent else { return }
+            self?.floatingBallController.showToast(toast)
         }
     }
 
@@ -165,8 +173,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     @MainActor private func refreshStatusDisplay(counts: StatusCounts) {
         lastRenderedCounts = counts
         statusItem.button?.image = MenubarIconRenderer.render(counts: counts)
-        notchController.update(counts: counts)
-        updateNotchVisibility()
+        floatingBallController.update(counts: counts)
         statusItem.button?.setAccessibilityLabel(counts.accessibilityLabel)
     }
 
@@ -195,50 +202,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         handleEvent(.menubarIconClicked(appIsActive: NSApp.isActive, onDifferentScreen: onDifferentScreen))
     }
 
-    /// Whether the status item is hidden behind the notch.
-    private var isStatusItemOccluded: Bool {
-        guard let screen = NSScreen.builtin, screen.hasPhysicalNotch else { return false }
-        guard let window = statusItem.button?.window, window.frame.width > 0 else { return true }
-
-        // macOS may keep the window but stop rendering it when space is tight
-        if !window.occlusionState.contains(.visible) { return true }
-
-        let visibleMinX = screen.frame.maxX - (screen.auxiliaryTopRightArea?.width ?? 0)
-        return window.frame.minX < visibleMinX
-    }
-
-    /// Show notch panel when the menubar icon is hidden behind the notch.
-    @MainActor private func updateNotchVisibility(immediate: Bool = false) {
-        notchVisibilityWork?.cancel()
-        guard hasNotch else {
-            notchController.tearDown(); return
-        }
-        let counts = lastRenderedCounts ?? .zero
-        let show: () -> Void = { [weak self] in
-            guard let self else { return }
-            let action = NotchStatusController.resolveVisibility(
-                hasNotch: self.hasNotch,
-                hasBuiltinScreen: NSScreen.builtin != nil,
-                appIsActive: NSApp.isActive,
-                pillExists: self.notchController.pillFrame != nil,
-                statusItemOccluded: self.isStatusItemOccluded
-            )
-            switch action {
-            case .show:
-                if let screen = NSScreen.builtin {
-                    self.notchController.showOnScreen(screen, counts: counts)
-                }
-            case .keep:
-                break
-            case .tearDown:
-                self.notchController.tearDown()
-            }
-        }
-        guard !immediate else { show(); return }
-        let work = DispatchWorkItem(block: show)
-        notchVisibilityWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
-    }
 
     private func applyAppearance() {
         switch AppearanceMode(rawValue: appearanceMode) ?? .system {
@@ -343,9 +306,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    /// The screen-space rect of the anchor (notch pill or menubar icon).
+    /// The screen-space rect of the anchor (floating ball or menubar icon).
     @MainActor private func anchorRect() -> NSRect? {
-        if let pillFrame = notchController.pillFrame {
+        if let pillFrame = floatingBallController.pillFrame {
             return pillFrame
         } else if let button = statusItem.button, let buttonWindow = button.window {
             return buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
@@ -354,7 +317,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     /// Reset panel position on double-click. If the panel is on the same screen
-    /// as the anchor (menubar icon / notch pill), snap to anchor. Otherwise, snap
+    /// as the anchor (floating ball / menubar icon), snap to anchor. Otherwise, snap
     /// to the top-center of the panel's current screen so it doesn't jump across screens.
     @MainActor private func resetPanelToCurrentScreen(animate: Bool = false) {
         guard let size = panelFittingSize() else { return }
@@ -390,8 +353,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.suppressResize = false
-            self.hasNotch = NSScreen.builtin?.hasPhysicalNotch == true
             self.refreshStatusDisplay(counts: StatusCounts(sessions: self.sessionManager.sessions))
+            if let screen = NSScreen.main {
+                self.floatingBallController.repositionOnScreen(screen)
+            }
             guard self.panel.isVisible else { return }
             self.positionPanel(animate: false)
             // Update saved position if it was clamped to new screen bounds
@@ -483,7 +448,6 @@ extension AppDelegate {
         for action in actions {
             switch action {
             case .showPanel:
-                notchVisibilityWork?.cancel()
                 panel.makeKeyAndOrderFront(nil)
                 // Re-position after SwiftUI layout settles
                 DispatchQueue.main.async { [weak self] in
@@ -495,7 +459,6 @@ extension AppDelegate {
                 focusLocation = nil
                 previousApp = nil
                 stopNavKeyMonitor()
-                updateNotchVisibility(immediate: true)
             case .navigatePanel:
                 panel.makeKeyAndOrderFront(nil)
             case .positionPanel:

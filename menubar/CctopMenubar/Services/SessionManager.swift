@@ -106,13 +106,36 @@ class SessionManager: ObservableObject {
     }
 
     private func sendTransitionNotifications(for newSessions: [Session], oldStatuses: [String: SessionStatus]) {
-        // Notifications: only a LIVE (active) session that NEWLY needs attention. Dormant never notifies.
         guard UserDefaults.standard.bool(forKey: "notificationsEnabled") else { return }
         for session in newSessions where session.lifecycle == .active {
             guard session.status.needsAttention,
                   let oldStatus = oldStatuses[SessionIdentityPolicy.stableKey(for: session)],
                   !oldStatus.needsAttention else { continue }
+            postFloatingBallToast(for: session)
             sendNotification(for: session)
+        }
+    }
+
+    private func postFloatingBallToast(for session: Session) {
+        let toast = ToastEvent(
+            sessionId: session.id,
+            projectName: session.displayName,
+            message: toastMessage(for: session),
+            status: session.status
+        )
+        NotificationCenter.default.post(name: .floatingBallToast, object: toast)
+    }
+
+    private func toastMessage(for session: Session) -> String {
+        switch session.status {
+        case .waitingPermission:
+            return session.notificationMessage ?? "Permission needed"
+        case .waitingInput:
+            return session.lastPrompt.map {
+                "Waiting: \(String($0.prefix(60)))"
+            } ?? "Waiting for input"
+        default:
+            return "Needs attention"
         }
     }
 
